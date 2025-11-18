@@ -1,6 +1,6 @@
 <h1>🎯 Ultimate AD Enumeration &amp; Exploitation Tool</h1>
 
-<p><strong>96%+ Active Directory coverage · BloodHound → BloodyAD automation · Modern HTML report</strong></p>
+<p><strong>Active Directory coverage · BloodHound → BloodyAD automation · Modern HTML report</strong></p>
 
 <p>
   This project is a <strong>modular, Kali-friendly AD assessment framework</strong> written mostly in Bash
