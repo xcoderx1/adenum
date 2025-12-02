@@ -51,12 +51,14 @@ class ADAuditState {
 # ==========================================
 # HELPERS & UI
 # ==========================================
-function Show-Banner {[ADAuditState]$s {Clear-Host; Write-Host @"
+function Show-Banner {[ADAuditState]$s {Clear-Host; Write-Host (
+@"
 ╔══════════════════════════════════════════════════════════════════════╗
 ║ 🎯 ULTIMATE AD ENUM & SECURITY AUDIT v$($s.Version) – FINAL EDITION   ║
 ║          16 Phases │ Parallel │ BloodHound Auto │ SARIF+HTML          ║
 ╚══════════════════════════════════════════════════════════════════════╝
-"@ -ForegroundColor Cyan}}
+"@
+) -ForegroundColor Cyan}}
 
 function Write-Section([string]$t){ Write-Host "`n$t`n$('='*80)" -ForegroundColor DarkCyan }
 function Get-ADParams([ADAuditState]$s){ @{Server=$s.DC; Credential=$s.Cred; ErrorAction='Stop'} }
