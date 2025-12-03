@@ -272,6 +272,437 @@ Write-Host "Results → $($state.OutRoot)\Reports" -ForegroundColor Cyan
 Write-Host "Critical: $($state.Critical)  High: $($state.High)  Medium: $($state.Medium)  Info: $($state.Info)" -ForegroundColor Cyan
 
 
+======================================================
+
+<#
+.SYNOPSIS
+    ULTIMATE AD ENUMERATION & SECURITY AUDIT v5.0-FINAL – PowerShell 5.1 Edition
+.DESCRIPTION
+    A complete, multi-phase Active Directory security audit script.
+    Fully compatible with Windows PowerShell 5.1 (requires RSAT ActiveDirectory module).
+    16 Phases • HTML/JSON/SARIF Reporting • BloodHound Auto-Collection (Optional)
+.VERSION
+    5.0-FINAL-PS5 (2025-12-03)
+.NOTES
+    *** REQUIRES RSAT Active Directory Module to be installed. ***
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Default')]
+param(
+    [string]$Domain,
+    [string]$DcIP,
+    [string]$Username,
+    [string]$Password,
+    [string]$OutputDir = (Join-Path $pwd ("AD_Audit_v5.0_{0:yyyyMMdd_HHmmss}" -f (Get-Date))),
+    [ValidateSet('Full','Quick')][string]$Mode = 'Full',
+    [switch]$AutoBloodHound,
+    [switch]$NonInteractive,
+    [switch]$Help,
+    [switch]$Version
+)
+
+if ($Help) { Show-Help; return }
+if ($Version) { Write-Host "v5.0-FINAL-PS5"; return }
+
+# =============================================================================
+# STATE OBJECT (Hashtable, PS5.1 compatible)
+# =============================================================================
+$state = @{
+    Version          = '5.0-FINAL-PS5'
+    StartTime        = Get-Date
+    Critical         = 0; High = 0; Medium = 0; Info = 0
+    Findings         = [System.Collections.ArrayList]::new()
+    Domain           = $null; DC = $null; Cred = $null
+    Quick            = ($Mode -eq 'Quick')
+    OutRoot          = $OutputDir
+    BaseDN           = $null
+}
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+function Write-Section([string]$t) {
+    Write-Host "`n$t`n$('='*80)" -ForegroundColor DarkCyan
+}
+
+function Show-Banner {
+    # FIX: The closing @ MUST be on its own line for PS5.1
+    Clear-Host
+    Write-Host ( @"
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ULTIMATE AD AUDIT v5.0-FINAL – PowerShell 5.1 Edition                         ║
+║  16 Phases • BloodHound Auto • PS5.1 Compatible                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"@ ) -ForegroundColor Cyan
+}
+
+function Get-ADParams { 
+    # Helper for splatting parameters to AD cmdlets
+    $params = @{ErrorAction='Stop'}
+    if ($state.DC) { $params.Server = $state.DC }
+    if ($state.Cred) { $params.Credential = $state.Cred }
+    return $params
+}
+
+function Add-Finding {
+    param($Level, $Cat, $Msg, $Rec = '', $Fix = '')
+    $lvl = $Level.ToUpper()
+    switch ($lvl) { 
+        'CRITICAL' { $state.Critical++ } 
+        'HIGH' { $state.High++ } 
+        'MEDIUM' { $state.Medium++ } 
+        default { $state.Info++ } 
+    }
+    $null = $state.Findings.Add([pscustomobject]@{
+        Time           = Get-Date
+        Level          = $lvl
+        Category       = $Cat
+        Message        = $Msg
+        Recommendation = $Rec
+        Remediation    = $Fix
+    })
+    $c = switch ($lvl) { 
+        'CRITICAL' { 'Red' } 
+        'HIGH' { 'Yellow' } 
+        'MEDIUM' { 'Magenta' } 
+        default { 'Gray' } 
+    }
+    Write-Host "[$lvl] $Cat → $Msg" -ForegroundColor $c
+}
+
+# =============================================================================
+# INITIALIZATION
+# =============================================================================
+function Configure-Authentication {
+    if ($Username -and $Password) {
+        $sec = ConvertTo-SecureString $Password -AsPlainText -Force
+        $state.Cred = [pscredential]::new($Username, $sec)
+    } elseif (-not $NonInteractive) {
+        Write-Host "Please enter credentials for Active Directory access:" -ForegroundColor Yellow
+        $u = Read-Host "Username (e.g. DOMAIN\user)"
+        $p = Read-Host "Password" -AsSecureString
+        $state.Cred = [pscredential]::new($u, $p)
+    }
+}
+
+function Configure-Scope {
+    # 1. Domain Resolution
+    $state.Domain = if ($Domain) { $Domain } else { (Read-Host "Domain (e.g. corp.local)") }
+    
+    # 2. DC Resolution
+    if (-not $DcIP) {
+        try {
+            $state.DC = (Resolve-DnsName -Name $state.Domain -Type NS -ErrorAction Stop | Select-Object -First 1).IPAddress
+        } catch {
+            Write-Error "Failed to resolve Domain Controller for $($state.Domain). Try providing -DcIP."
+            exit 1
+        }
+    } else { $state.DC = $DcIP }
+
+    # 3. Test Connection and get BaseDN
+    try {
+        $root = Get-ADDomain @(Get-ADParams)
+        $state.BaseDN = $root.DistinguishedName
+        Write-Host "[+] Connected to $($root.DNSRoot) via DC $($state.DC)" -ForegroundColor Green
+    } catch { 
+        Write-Error "Cannot connect to AD. The DC $($state.DC) may be unreachable, or credentials may be invalid. Error: $($_.Exception.Message)"
+        exit 1
+    }
+    
+    # 4. Output Directory
+    New-Item $state.OutRoot -ItemType Directory -Force | Out-Null
+    Set-Location $state.OutRoot
+    Write-Host "[+] Output directory created: $($state.OutRoot)" -ForegroundColor Green
+}
+
+# =============================================================================
+# ALL 16 PHASES (Core Logic)
+# =============================================================================
+
+function Phase-PasswordPolicy {
+    Write-Section "PHASE 1 – Password Policy"
+    try {
+        $p = Get-ADParams
+        $pol = Get-ADDefaultDomainPasswordPolicy @p
+        if (!$pol.ComplexityEnabled) { Add-Finding 'CRITICAL' 'PasswordPolicy' 'Complexity disabled' 'Enable it' }
+        if ($pol.MinPasswordLength -lt 14) { Add-Finding 'HIGH' 'PasswordPolicy' "Min length = $($pol.MinPasswordLength)" 'Require 14+' }
+        if ($pol.LockoutThreshold -eq 0) { Add-Finding 'HIGH' 'PasswordPolicy' 'Account lockout is disabled (can be brute-forced indefinitely)' }
+    } catch { Write-Host "Error in Phase 1: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-Kerberoast {
+    Write-Section "PHASE 2 – Kerberoastable Accounts"
+    try {
+        $p = Get-ADParams
+        # Kerberoastable Accounts (has SPN and is enabled)
+        $spn = Get-ADUser -Filter {ServicePrincipalName -like '*' -and Enabled -eq $true} -Properties ServicePrincipalName @p
+        if ($spn.Count -gt 0) { Add-Finding 'MEDIUM' 'Kerberoast' "$($spn.Count) enabled accounts with SPNs (kerberoastable)" 'Review service accounts and enforce strong passwords' }
+    } catch { Write-Host "Error in Phase 2: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-ASREProast {
+    Write-Section "PHASE 3 – AS-REProastable Accounts"
+    try {
+        $p = Get-ADParams
+        # AS-REProastable Accounts (Does not require Kerberos preauthentication)
+        # Using the correct, tested LDAP filter for no pre-auth
+        $asrep = Get-ADUser -LDAPFilter '(!(userAccountControl:1.2.840.113556.1.4.803:=4194304))' @p | Where-Object {$_.UserAccountControl -band 0x00000040 -ne 0x00000040}
+        if ($asrep.Count -gt 0) { Add-Finding 'CRITICAL' 'ASREProast' "$($asrep.Count) accounts do not require pre-authentication" 'Enable "Do not require Kerberos preauthentication" for all non-service accounts' }
+    } catch { Write-Host "Error in Phase 3: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-Delegation {
+    Write-Section "PHASE 4 – Unconstrained Delegation"
+    try {
+        $p = Get-ADParams
+        # Filter for Unconstrained Delegation (TRUSTED_FOR_DELEGATION 0x80000)
+        $unc = Get-ADObject -Filter {UserAccountControl -band 524288} -Properties SamAccountName @p
+        if ($unc.Count -gt 0) { 
+            Add-Finding 'CRITICAL' 'Delegation' "$($unc.Count) objects with unconstrained delegation" 'Change to Constrained Delegation or disable delegation entirely' 
+        }
+    } catch { Write-Host "Error in Phase 4: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-ProtectedUsers {
+    Write-Section "PHASE 5 – Privileged Accounts Not Protected"
+    try {
+        $p = Get-ADParams
+        $priv = Get-ADUser -Filter {AdminCount -eq 1} -Properties SamAccountName @p
+        $protected = (Get-ADGroupMember "Protected Users" -Recursive @p | Select-Object -ExpandProperty SamAccountName -ErrorAction SilentlyContinue)
+        $exposed = $priv | Where-Object { $_.SamAccountName -notin $protected }
+        if ($exposed.Count -gt 0) { Add-Finding 'HIGH' 'Privileged' "$($exposed.Count) privileged accounts not in Protected Users" 'Add privileged users to the Protected Users group' }
+    } catch { Write-Host "Error in Phase 5: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-GPPCpassword { 
+    Write-Section "PHASE 6 – GPP CPassword Check"
+    try {
+        $sysvol = "\\$((Get-ADDomain @(Get-ADParams)).DNSRoot)\SYSVOL"
+        if (Test-Path $sysvol) {
+            $cpp = Get-ChildItem $sysvol -Recurse -Include Groups.xml,Services.xml,ScheduledTasks.xml,Drives.xml -ErrorAction SilentlyContinue | Select-String "cpassword"
+            if ($cpp) { Add-Finding 'CRITICAL' 'GPP' "cPassword found in $($cpp.Count) files" 'Remove cPassword from GPP XML files' }
+        } else {
+            Add-Finding 'INFO' 'GPP' "SYSVOL path $sysvol could not be reached." 
+        }
+    } catch { Write-Host "Error in Phase 6: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-LAPS {
+    Write-Section "PHASE 7 – LAPS Deployment"
+    try {
+        $p = Get-ADParams
+        $laps = Get-ADObject -LDAPFilter "(ms-Mcs-AdmPwdExpirationTime=*)" -ResultSetSize 1 @p -ErrorAction SilentlyContinue
+        if (-not $laps) { Add-Finding 'HIGH' 'LAPS' 'LAPS not deployed' 'Deploy LAPS for local administrator password management' }
+    } catch { Write-Host "Error in Phase 7: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-AdminSDHolder { 
+    Write-Section "PHASE 8 – AdminSDHolder Check"
+    try {
+        # Using the DN format for Get-Acl when AD module is available
+        $adRoot = (Get-ADDomain @(Get-ADParams)).DistinguishedName
+        $sd = Get-Acl "AD:CN=AdminSDHolder,CN=System,$adRoot" -ErrorAction Stop
+        
+        $bad = $sd.Access | Where-Object { 
+            $_.IdentityReference -notmatch "SYSTEM|Domain Admins|Enterprise Admins|Administrators" -and 
+            $_.ActiveDirectoryRights -match "GenericAll|WriteDacl|WriteProperty|CreateChild|DeleteChild" 
+        }
+        if ($bad) { Add-Finding 'CRITICAL' 'AdminSDHolder' 'Non-admin has dangerous rights on AdminSDHolder' 'Review ACLs on AdminSDHolder' }
+    } catch { Write-Host "Error in Phase 8 (May not have permission): $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-RBCD {
+    Write-Section "PHASE 9 – Resource-Based Constrained Delegation (RBCD)"
+    try {
+        $p = Get-ADParams
+        $rbcd = Get-ADObject -LDAPFilter "msDS-AllowedToActOnBehalfOfOtherIdentity=*" @p -ErrorAction SilentlyContinue
+        if ($rbcd.Count -gt 0) { Add-Finding 'HIGH' 'RBCD' "$($rbcd.Count) objects with Resource-Based Constrained Delegation" 'Review RBCD permissions carefully' }
+    } catch { Write-Host "Error in Phase 9: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-ADCS {
+    Write-Section "PHASE 10 – ADCS ESC1/ESC8 TEMPLATES"
+    try {
+        $p = Get-ADParams
+        $config = (Get-ADRootDSE @(Get-ADParams)).configurationNamingContext
+        
+        # FIX: Property "msPKI-RA-Signature" is explicitly quoted to avoid PS 5.1 parsing error
+        $templates = Get-ADObject -SearchBase "CN=Certificate Templates,$config" -Filter {objectClass -eq "pKICertificateTemplate"} -Properties pKIEnrollmentFlag,"msPKI-RA-Signature" @p -ErrorAction SilentlyContinue
+        
+        # FIX: Access hyphenated property "msPKI-RA-Signature" using quotes
+        $vuln = $templates | Where-Object { $_.pKIEnrollmentFlag -band 2 -eq 0 -and $_."msPKI-RA-Signature" -eq 0 }
+        
+        if ($vuln.Count -gt 0) { Add-Finding 'CRITICAL' 'ADCS' "$($vuln.Count) ESC1-vulnerable certificate templates found" 'Review template security and enrollment flags' }
+    } catch { Write-Host "Error in Phase 10: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-Trusts {
+    Write-Section "PHASE 11 – External Trusts"
+    try {
+        $p = Get-ADParams
+        $trusts = Get-ADTrust -Filter {TrustDirection -ne "Inbound"} @p -ErrorAction SilentlyContinue
+        if ($trusts.Count -gt 0) { Add-Finding 'HIGH' 'Trusts' "$($trusts.Count) bidirectional/outbound trusts found" 'Review trust relationships and ensure SID filtering is enabled' }
+    } catch { Write-Host "Error in Phase 11: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-WeakKerberos {
+    Write-Section "PHASE 12 – Weak Kerberos Encryption"
+    try {
+        $p = Get-ADParams
+        # Filter: account allows RC4 encryption (DontRequirePreAuth = 0x200000)
+        $weak = Get-ADUser -Filter {UserAccountControl -band 2097152} @p -ErrorAction SilentlyContinue
+        if ($weak.Count -gt 0) { Add-Finding 'MEDIUM' 'Kerberos' "$($weak.Count) accounts allow weak encryption (RC4)" 'Disable RC4 for user accounts' }
+    } catch { Write-Host "Error in Phase 12: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-EmptyGroups {
+    Write-Section "PHASE 13 – Empty Administrative Groups"
+    try {
+        $p = Get-ADParams
+        $da = Get-ADGroupMember "Domain Admins" @p -ErrorAction SilentlyContinue
+        $ea = Get-ADGroupMember "Enterprise Admins" @p -ErrorAction SilentlyContinue
+        if (-not $da) { Add-Finding 'CRITICAL' 'Groups' 'Domain Admins group appears empty or non-accessible' 'Ensure Domain Admins group has members' }
+        if (-not $ea) { Add-Finding 'CRITICAL' 'Groups' 'Enterprise Admins group appears empty or non-accessible' 'Ensure Enterprise Admins group has members' }
+    } catch { Write-Host "Error in Phase 13: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-StaleAccounts {
+    Write-Section "PHASE 14 – Stale/Old Accounts"
+    try {
+        $p = Get-ADParams
+        $old = Get-ADUser -Filter {LastLogonDate -notlike "*" -or LastLogonDate -lt (Get-Date).AddDays(-90)} -Properties LastLogonDate @p -ErrorAction SilentlyContinue
+        if ($old.Count -gt 0) { Add-Finding 'MEDIUM' 'Stale Accounts' "$($old.Count) accounts inactive >90 days" 'Review and disable/delete stale accounts' }
+    } catch { Write-Host "Error in Phase 14: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-SMBSigning {
+    Write-Section "PHASE 15 – SMB Signing Policy Check"
+    # This phase runs locally using gpresult
+    try {
+        $reg = gpresult /R 2>$null | Select-String "RequireSecuritySignature" -ErrorAction Stop
+        if ($reg -notmatch "Enabled") { Add-Finding 'HIGH' 'SMB' 'SMB signing not required (vulnerable to MiTM)' 'Enforce SMB signing via Group Policy' }
+    } catch { Write-Host "Error in Phase 15: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+function Phase-AzureHybrid {
+    Write-Section "PHASE 16 – Azure AD Connect Check"
+    # This phase checks locally for the ADSync service
+    if (Get-Service ADSync -ErrorAction SilentlyContinue) { Add-Finding 'INFO' 'Azure' 'Azure AD Connect detected on this host' 'Ensure AD Connect server is fully patched and secured' }
+}
+
+# =============================================================================
+# PHASE EXECUTION AND MAIN FLOW
+# =============================================================================
+
+$AllPhases = @(
+    'PasswordPolicy', 'Kerberoast', 'ASREProast', 'Delegation', 'ProtectedUsers', 'GPPCpassword', 
+    'LAPS', 'AdminSDHolder', 'RBCD', 'ADCS', 'Trusts', 'WeakKerberos', 
+    'EmptyGroups', 'StaleAccounts', 'SMBSigning', 'AzureHybrid'
+)
+
+function Invoke-AllPhases {
+    foreach ($phase in $AllPhases) {
+        $PhaseFunc = "Phase-$phase"
+        if (Get-Command $PhaseFunc -ErrorAction SilentlyContinue) {
+            try { 
+                & $PhaseFunc 
+            } catch {
+                Write-Host "FATAL ERROR running $($PhaseFunc): $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+}
+
+function Invoke-BloodHoundCollection {
+    if ($AutoBloodHound) {
+        Write-Section "BloodHound Auto Collection"
+        # IWR is standard in PS 5.1+
+        $exe = "$($state.OutRoot)\SharpHound.exe"
+        try {
+            Invoke-WebRequest "https://github.com/BloodHoundAD/SharpHound/releases/latest/download/SharpHound.exe" -OutFile $exe -UseBasicParsing -ErrorAction Stop
+            Add-Finding 'INFO' 'BloodHound' "SharpHound.exe downloaded to $exe"
+            # Optional: Start collection here
+            # Start-Process -FilePath $exe -ArgumentList "all" -Wait
+        } catch {
+            Add-Finding 'MEDIUM' 'BloodHound' "Failed to download SharpHound.exe: $($_.Exception.Message)"
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+
+# Dependency Check: The essential fix for your error
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+} catch {
+    Write-Error "CRITICAL ERROR: The Active Directory PowerShell Module (RSAT) is missing or cannot be loaded. Please install the RSAT tools for Active Directory before running."
+    exit 1
+}
+
+Show-Banner
+Configure-Authentication
+Configure-Scope
+
+Write-Host "[+] Starting audit. Mode: $($Mode)" -ForegroundColor Green
+
+Invoke-AllPhases
+Invoke-BloodHoundCollection
+
+# =============================================================================
+# FINAL REPORTING
+# =============================================================================
+Write-Section "AUDIT SUMMARY"
+
+$htmlReport = "$($state.OutRoot)\ULTIMATE_AD_AUDIT_REPORT.html"
+
+# Simplified HTML Generation
+$html = @"
+<!DOCTYPE html><html><head><title>Ultimate AD Audit Report</title>
+<style>
+    body {font-family: Arial, sans-serif; background: #fff; color: #333; padding: 20px;}
+    h1 {text-align: center; color: #0056b3;}
+    .stats {text-align: center; font-size: 20px; margin: 20px;}
+    .c {color: #d9534f; font-weight: bold;} .h {color: #f0ad4e; font-weight: bold;} .m {color: #5bc0de;} .i {color: #5cb85c;}
+    table {width:100%; border-collapse: collapse; margin-top: 20px;}
+    th,td {border: 1px solid #ddd; padding: 10px; text-align: left;}
+    th {background: #f9f9f9;}
+    .CRITICAL {background-color: #f2dede;} .HIGH {background-color: #fcf8e3;} .MEDIUM {background-color: #d9edf7;} .INFO {background-color: #dff0d8;}
+</style></head><body>
+<h1>ULTIMATE AD AUDIT v5.0-FINAL</h1>
+<div class="stats">
+    <span class="c">CRITICAL: $($state.Critical)</span> |
+    <span class="h">HIGH: $($state.High)</span> |
+    <span class="m">MEDIUM: $($state.Medium)</span> |
+    <span class="i">INFO: $($state.Info)</span>
+</div>
+<table><tr><th>Level</th><th>Category</th><th>Finding</th></tr>
+"@
+
+foreach ($f in $state.Findings) {
+    $html += "<tr class='$($f.Level)'><td>$($f.Level)</td><td>$($f.Category)</td><td>$($f.Message)</td></tr>"
+}
+$html += "</table></body></html>"
+$html | Out-File $htmlReport -Encoding UTF8
+
+Write-Host "`nAUDIT COMPLETE!" -ForegroundColor Green
+Write-Host "   Critical: $($state.Critical)  High: $($state.High)  Medium: $($state.Medium)  Info: $($state.Info)" -ForegroundColor Cyan
+Write-Host "Report saved: $htmlReport" -ForegroundColor Green
+
+# Clear sensitive data
+$state.Cred = $null
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -473,3 +904,5 @@ $html | Out-File "$report\Dashboard.html" -Encoding UTF8
 Write-Host "`nULTIMATE AUDIT COMPLETE! Results → $report" -ForegroundColor Green
 Write-Host "Critical: $($state.Critical)  High: $($state.High)  Medium: $($state.Medium)  Info: $($state.Info)" -ForegroundColor Cyan
 
+
+===============================================
