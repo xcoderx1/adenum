@@ -1,0 +1,4 @@
+DOMAIN="domain.local"   # change this to your domain
+dig +short SRV _ldap._tcp.dc._msdcs.$DOMAIN \
+  | awk '{print $4}' | sed 's/\.$//' \
+  | xargs -n1 getent hosts
